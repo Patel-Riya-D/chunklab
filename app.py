@@ -3,11 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from analytics.metrics import chunk_metrics, retrieval_metrics
+from analytics.metrics import chunk_metrics
 from assistant.rag_assistant import RAGAssistant
 from chunking.registry import get_chunker
 from extraction.registry import EXTRACTION_REGISTRY, get_extractor
-from ui.components import chunk_table, show_chunk, show_retrieved, show_units
+from ui.components import show_chunk, show_retrieved, show_units
 from utils.compatibility import CHUNKING_STRATEGIES, compatible_chunkers
 from utils.document import human_size, make_uploaded_document
 
@@ -73,9 +73,7 @@ with st.sidebar:
     if st.session_state.chunks:
         st.metric("Chunks", len(st.session_state.chunks))
 
-document_tab, assistant_tab, analytics_tab = st.tabs(
-    ["Document Lab", "Retrieval Assistant", "Analytics / Metrics"]
-)
+document_tab, assistant_tab = st.tabs(["Document Lab", "Retrieval Assistant"])
 
 with document_tab:
     st.header("Upload, Extraction, Chunking, and Preview")
@@ -208,52 +206,22 @@ with assistant_tab:
         st.warning("Generate chunks before using the assistant.")
     else:
         top_k = st.slider("Retrieved chunks", 1, min(10, len(st.session_state.chunks)), min(5, len(st.session_state.chunks)))
+        answer_mode_label = st.radio(
+            "Answer mode",
+            ["LLM from retrieved chunks", "Extractive, no LLM"],
+            horizontal=True,
+        )
+        answer_mode = "llm" if answer_mode_label == "LLM from retrieved chunks" else "extractive"
         question = st.chat_input("Ask a question to evaluate retrieval quality")
         if question:
             with st.spinner("Retrieving relevant chunks..."):
-                turn = st.session_state.assistant.answer(question, top_k=top_k)
+                turn = st.session_state.assistant.answer(question, top_k=top_k, answer_mode=answer_mode)
                 st.session_state.chat_history.append(turn)
 
         for turn in st.session_state.chat_history:
             with st.chat_message("user"):
                 st.write(turn.question)
             with st.chat_message("assistant"):
-                st.write(turn.answer)
-                st.caption(f"Retrieval latency: {turn.latency_ms:.1f} ms")
-                show_retrieved(turn.retrieved)
-
-with analytics_tab:
-    st.header("Analytics / Metrics")
-    chunks = st.session_state.chunks
-    chunk_stats = chunk_metrics(chunks)
-    retrieval_stats = retrieval_metrics(st.session_state.chat_history)
-
-    cols = st.columns(5)
-    cols[0].metric("Chunks", chunk_stats["chunk_count"])
-    cols[1].metric("Avg chars", chunk_stats["avg_chars"])
-    cols[2].metric("Avg tokens", chunk_stats["avg_tokens_est"])
-    cols[3].metric("Queries", retrieval_stats["queries"])
-    cols[4].metric("Avg latency ms", retrieval_stats["avg_latency_ms"])
-
-    if chunks:
-        st.subheader("Chunk Size Distribution")
-        st.bar_chart(pd.DataFrame({"chars": chunk_stats["size_distribution"]}))
-        st.subheader("Chunk Metadata")
-        st.dataframe(chunk_table(chunks), use_container_width=True, hide_index=True)
-
-    if st.session_state.chat_history:
-        st.subheader("Top Retrieved Chunks")
-        st.write(retrieval_stats["top_retrieved_chunks"])
-        rows = []
-        for turn in st.session_state.chat_history:
-            for result in turn.retrieved:
-                rows.append(
-                    {
-                        "question": turn.question,
-                        "chunk_id": result.chunk.id,
-                        "score": round(result.score, 4),
-                        "rank": result.rank,
-                        "latency_ms": round(turn.latency_ms, 1),
-                    }
-                )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.markdown(turn.answer)
+                with st.expander(f"Retrieved chunks ({len(turn.retrieved)}) for: {turn.question} | {turn.latency_ms:.1f} ms", expanded=False):
+                    show_retrieved(turn.retrieved)

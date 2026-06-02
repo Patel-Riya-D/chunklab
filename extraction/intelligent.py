@@ -4,7 +4,7 @@ import ast
 import re
 
 from extraction.base import BaseExtractor
-from extraction.structured import _section_units
+from extraction.structured import _attach_unit_context, _extract_table_units, _ordered_units, _section_units
 from utils.models import ExtractedUnit, ExtractionResult, UploadedDocument
 from utils.text import split_sentences
 
@@ -40,6 +40,7 @@ class SemanticSegmentationExtractor(BaseExtractor):
 
     def extract(self, document: UploadedDocument) -> ExtractionResult:
         text = self._read_text(document)
+        table_units = _extract_table_units(document, text)
         sentences = split_sentences(text)
         units: list[ExtractedUnit] = []
         for start in range(0, len(sentences), 5):
@@ -47,7 +48,12 @@ class SemanticSegmentationExtractor(BaseExtractor):
             if segment:
                 idx = len(units) + 1
                 units.append(ExtractedUnit(id=f"semantic-{idx}", text=segment, unit_type="semantic_segment", metadata={"segment": idx}))
-        return self._result(text, units or [ExtractedUnit(id="semantic-1", text=text, unit_type="semantic_segment")])
+        units = units or [ExtractedUnit(id="semantic-1", text=text, unit_type="semantic_segment")]
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*units, *table_units])),
+            {"tables_detected": len(table_units)},
+        )
 
 
 class ClauseAwareExtractor(BaseExtractor):
@@ -57,12 +63,17 @@ class ClauseAwareExtractor(BaseExtractor):
 
     def extract(self, document: UploadedDocument) -> ExtractionResult:
         text = self._read_text(document)
+        table_units = _extract_table_units(document, text)
         clauses = [c.strip() for c in re.split(r"(?:(?<=;)|(?<=:)|\n\s*(?:\([a-z0-9]+\)|[a-z0-9]+\.)\s+)", text) if c.strip()]
         units = [
             ExtractedUnit(id=f"clause-{idx}", text=clause, unit_type="clause", metadata={"clause": idx})
             for idx, clause in enumerate(clauses, start=1)
         ]
-        return self._result(text, units, {"clauses": len(units)})
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*units, *table_units])),
+            {"clauses": len(units), "tables_detected": len(table_units)},
+        )
 
 
 class CodeAwareExtractor(BaseExtractor):
@@ -72,10 +83,15 @@ class CodeAwareExtractor(BaseExtractor):
 
     def extract(self, document: UploadedDocument) -> ExtractionResult:
         text = self._read_text(document)
+        table_units = _extract_table_units(document, text)
         if document.suffix == ".py":
             units = _python_code_units(text)
             if units:
-                return self._result(text, units, {"symbols": len([unit for unit in units if unit.unit_type == "code_symbol"])})
+                return self._result(
+                    text,
+                    _attach_unit_context(_ordered_units([*units, *table_units])),
+                    {"symbols": len([unit for unit in units if unit.unit_type == "code_symbol"]), "tables_detected": len(table_units)},
+                )
 
         pattern = re.compile(
             r"^\s*(?:(async)\s+)?(?:(def|class|function)\s+([A-Za-z_][\w]*)|"
@@ -100,7 +116,12 @@ class CodeAwareExtractor(BaseExtractor):
                     metadata={"symbol": symbol, "kind": kind},
                 )
             )
-        return self._result(text, units or _section_units(text), {"symbols": len(units)})
+        units = units or _section_units(text)
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*units, *table_units])),
+            {"symbols": len(units), "tables_detected": len(table_units)},
+        )
 
 
 def _python_code_units(text: str) -> list[ExtractedUnit]:
@@ -170,5 +191,10 @@ class IDPExtractor(BaseExtractor):
 
     def extract(self, document: UploadedDocument) -> ExtractionResult:
         text = self._read_text(document)
+        table_units = _extract_table_units(document, text)
         units = _section_units(text)
-        return self._result(text, units, {"idp_status": "placeholder", "entities": []})
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*units, *table_units])),
+            {"idp_status": "placeholder", "entities": [], "tables_detected": len(table_units)},
+        )

@@ -242,7 +242,7 @@ def _pdf_section_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | None
             )
         )
 
-    return full_text, _merge_wrapped_pdf_sections(units)
+    return full_text, units
 
 
 def _dominant_body_size(blocks: list[_PdfTextBlock]) -> float:
@@ -327,50 +327,6 @@ def _is_structural_pdf_heading(block: _PdfTextBlock) -> bool:
     return uppercase_ratio >= 0.85 and len(text.split()) <= 7
 
 
-def _merge_wrapped_pdf_sections(units: list[ExtractedUnit]) -> list[ExtractedUnit]:
-    merged: list[ExtractedUnit] = []
-    for unit in units:
-        if (
-            merged
-            and unit.unit_type == "section"
-            and _looks_like_wrapped_heading_continuation(merged[-1], unit)
-        ):
-            previous = merged[-1]
-            previous_title = str(previous.metadata.get("title", "")).strip()
-            current_title = str(unit.metadata.get("title", "")).strip()
-            combined_title = f"{previous_title} {current_title}".strip()
-            previous.metadata["title"] = combined_title
-            previous.metadata["section_path"] = combined_title
-            previous.text = "\n\n".join(part for part in [previous.text.strip(), unit.text.strip()] if part)
-            continue
-        merged.append(unit)
-    for index, unit in enumerate(merged, start=1):
-        if unit.unit_type == "section":
-            unit.id = f"section-{index}"
-            unit.metadata["section"] = index
-    return merged
-
-
-def _looks_like_wrapped_heading_continuation(previous: ExtractedUnit, current: ExtractedUnit) -> bool:
-    if previous.metadata.get("page") != current.metadata.get("page"):
-        return False
-    previous_bbox = previous.metadata.get("bbox")
-    current_bbox = current.metadata.get("bbox")
-    if not (_is_bbox(previous_bbox) and _is_bbox(current_bbox)):
-        return False
-    if current_bbox[1] - previous_bbox[3] > 35:
-        return False
-    previous_title = str(previous.metadata.get("title", "")).strip()
-    current_title = str(current.metadata.get("title", "")).strip()
-    if not previous_title or not current_title or len(current_title.split()) > 3:
-        return False
-    return bool(
-        re.match(r"^Section\s+\d+:", previous_title)
-        or previous_title.endswith("&")
-        or previous_title.endswith(",")
-    )
-
-
 class SectionWiseExtractor(BaseExtractor):
     method_id = "section_wise"
     name = "Section-wise Extraction"
@@ -429,7 +385,12 @@ class HierarchicalExtractor(BaseExtractor):
             else:
                 roots.append(section)
             stack.append(section)
-        return self._result(text, roots, {"sections": len(sections), "hierarchy_roots": len(roots)})
+        table_units = [unit for unit in section_result.units if unit.unit_type == "table"]
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*roots, *table_units])),
+            {"sections": len(sections), "hierarchy_roots": len(roots), "tables_detected": len(table_units)},
+        )
 
 
 class LayoutAwareExtractor(BaseExtractor):
@@ -438,6 +399,19 @@ class LayoutAwareExtractor(BaseExtractor):
     description = "Preserves page, block, and bounding-box metadata when the parser exposes it."
 
     def extract(self, document: UploadedDocument) -> ExtractionResult:
+        if document.suffix == ".docx":
+            docx_result = _docx_block_units(document.content)
+            if docx_result:
+                text, units = docx_result
+                return self._result(
+                    text,
+                    _attach_unit_context(units),
+                    {
+                        "layout_blocks": sum(1 for unit in units if unit.unit_type != "table"),
+                        "tables_detected": sum(1 for unit in units if unit.unit_type == "table"),
+                    },
+                )
+
         blocks = self._read_pdf_blocks(document.content) if document.suffix == ".pdf" else []
         if not blocks:
             return SectionWiseExtractor().extract(document)
@@ -450,7 +424,13 @@ class LayoutAwareExtractor(BaseExtractor):
             )
             for idx, block in enumerate(blocks, start=1)
         ]
-        return self._result("\n\n".join(unit.text for unit in units), units, {"layout_blocks": len(units)})
+        text = "\n\n".join(unit.text for unit in units)
+        table_units = _extract_table_units(document, text)
+        return self._result(
+            text,
+            _attach_unit_context(_ordered_units([*units, *table_units])),
+            {"layout_blocks": len(units), "tables_detected": len(table_units)},
+        )
 
 
 class TableAwareExtractor(BaseExtractor):
@@ -565,6 +545,179 @@ def _extract_table_units(document: UploadedDocument, text: str) -> list[Extracte
     if document.suffix in {".txt", ".md", ".markdown"}:
         return _delimited_table_units(text)
     return _delimited_table_units(text)
+
+
+def _pdf_pages_without_tables(content: bytes) -> list[str]:
+    table_areas = _pdf_table_areas(content)
+    try:
+        import fitz
+
+        doc = fitz.open(stream=content, filetype="pdf")
+        pages: list[str] = []
+        for page_index, page in enumerate(doc, start=1):
+            parts = []
+            for block in page.get_text("blocks"):
+                bbox = tuple(round(float(value), 2) for value in block[:4])
+                text = normalize_whitespace(str(block[4]))
+                if text and not _overlaps_any_table(bbox, table_areas.get(page_index, [])):
+                    parts.append(text)
+            pages.append("\n\n".join(parts).strip())
+        return pages
+    except Exception:
+        try:
+            import pdfplumber
+
+            pages = []
+            with pdfplumber.open(BytesIO(content)) as pdf:
+                for page_index, page in enumerate(pdf.pages, start=1):
+                    table_bboxes = table_areas.get(page_index, [])
+                    filtered = page
+                    for bbox in table_bboxes:
+                        filtered = filtered.filter(lambda obj, table_bbox=bbox: not _pdfplumber_obj_overlaps_table(obj, table_bbox))
+                    pages.append((filtered.extract_text() or "").strip())
+            return pages
+        except Exception:
+            return []
+
+
+def _pdfplumber_obj_overlaps_table(obj: dict[str, object], table_bbox: tuple[float, float, float, float]) -> bool:
+    try:
+        bbox = (
+            float(obj["x0"]),
+            float(obj["top"]),
+            float(obj["x1"]),
+            float(obj["bottom"]),
+        )
+    except Exception:
+        return False
+    return _overlap_ratio(bbox, table_bbox) > 0.15
+
+
+def _docx_page_units(content: bytes, target_chars: int = 2600) -> tuple[str, list[ExtractedUnit]] | None:
+    ordered = _docx_linear_units(content)
+    if ordered is None:
+        return None
+
+    full_text = "\n\n".join(unit.text for unit in ordered).strip()
+    pages: list[ExtractedUnit] = []
+    page_parts: list[str] = []
+    page_start_order = 1.0
+    page_number = 1
+    explicit_breaks = any(unit.metadata.get("page_break_after") for unit in ordered)
+
+    def flush(force: bool = False) -> None:
+        nonlocal page_parts, page_number, page_start_order
+        page_text = "\n\n".join(part for part in page_parts if part.strip()).strip()
+        if not page_text and not force:
+            return
+        if page_text:
+            pages.append(
+                ExtractedUnit(
+                    id=f"page-{page_number}",
+                    text=page_text,
+                    unit_type="page",
+                    metadata={
+                        "page": page_number,
+                        "order": page_start_order,
+                        "page_source": "explicit_break" if explicit_breaks else "estimated_docx_page",
+                    },
+                )
+            )
+            page_number += 1
+        page_parts = []
+        page_start_order = float(page_number)
+
+    for unit in ordered:
+        unit_order = float(unit.metadata.get("order", page_number))
+        if not page_parts:
+            page_start_order = unit_order
+        projected = len("\n\n".join([*page_parts, unit.text]))
+        should_estimate_break = not explicit_breaks and page_parts and projected > target_chars
+        if should_estimate_break:
+            flush()
+            page_start_order = unit_order
+        page_parts.append(unit.text)
+        if unit.metadata.get("page_break_after"):
+            flush(force=True)
+    flush()
+
+    for unit in ordered:
+        unit_page = _find_docx_unit_page(unit, pages)
+        if unit_page:
+            unit.metadata.setdefault("page", unit_page)
+    return full_text, _ordered_units([*pages, *[unit for unit in ordered if unit.unit_type == "table"]])
+
+
+def _find_docx_unit_page(unit: ExtractedUnit, pages: list[ExtractedUnit]) -> int | None:
+    unit_text = unit.text.strip()
+    if not unit_text:
+        return None
+    probe = unit_text[: min(120, len(unit_text))]
+    for page in pages:
+        if probe and probe in page.text:
+            return int(page.metadata.get("page", 0) or 0)
+    return None
+
+
+def _docx_block_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | None:
+    ordered = _docx_linear_units(content)
+    if ordered is None:
+        return None
+    return "\n\n".join(unit.text for unit in ordered).strip(), _ordered_units(ordered)
+
+
+def _docx_linear_units(content: bytes) -> list[ExtractedUnit] | None:
+    try:
+        from docx import Document
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        from docx.oxml.ns import qn
+
+        doc = Document(BytesIO(content))
+        units: list[ExtractedUnit] = []
+        table_count = 0
+        paragraph_count = 0
+        order = 0
+        for child in doc.element.body.iterchildren():
+            if child.tag == qn("w:p"):
+                order += 1
+                paragraph = Paragraph(child, doc)
+                text = paragraph.text.strip()
+                if not text and not _docx_has_page_break(child):
+                    continue
+                if text:
+                    paragraph_count += 1
+                    units.append(
+                        ExtractedUnit(
+                            id=f"paragraph-{paragraph_count}",
+                            text=text,
+                            unit_type="paragraph",
+                            metadata={
+                                "paragraph": paragraph_count,
+                                "order": order,
+                                "style": getattr(getattr(paragraph, "style", None), "name", "") or "",
+                                "page_break_after": _docx_has_page_break(child),
+                            },
+                        )
+                    )
+                elif units and _docx_has_page_break(child):
+                    units[-1].metadata["page_break_after"] = True
+            elif child.tag == qn("w:tbl"):
+                order += 1
+                table = Table(child, doc)
+                rows = _clean_table_rows([[cell.text for cell in row.cells] for row in table.rows])
+                if not _is_valid_table(rows):
+                    continue
+                table_count += 1
+                units.append(_make_table_unit(table_count, rows, "docx", {"order": order}))
+        return units
+    except Exception:
+        return None
+
+
+def _docx_has_page_break(element: object) -> bool:
+    xml = getattr(element, "xml", "")
+    return 'w:type="page"' in xml or "lastRenderedPageBreak" in xml
 
 
 def _docx_ordered_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | None:
@@ -742,8 +895,8 @@ def _pdf_table_areas(content: bytes) -> dict[int, list[tuple[float, float, float
                 for table in page.find_tables() or []:
                     rows = _clean_table_rows(table.extract())
                     bbox = tuple(round(float(value), 2) for value in table.bbox)
-                    if _is_valid_table(rows) and _is_valid_pdf_table(rows, bbox):
-                        page_areas.append(tuple(round(float(value), 2) for value in table.bbox))
+                    if _is_valid_pdf_table(rows, bbox):
+                        page_areas.append(bbox)
                 if page_areas:
                     areas[page_number] = page_areas
         return areas
@@ -778,10 +931,11 @@ def _pdf_table_units(content: bytes) -> list[ExtractedUnit]:
         units: list[ExtractedUnit] = []
         with pdfplumber.open(BytesIO(content)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
+                page_table_count = 0
                 for table in page.find_tables() or []:
-                    rows = _clean_table_rows(table.extract())
+                    rows = _repair_pdf_table_rows(_clean_table_rows(table.extract()))
                     bbox = tuple(round(float(value), 2) for value in table.bbox)
-                    if not _is_valid_table(rows) or not _is_valid_pdf_table(rows, bbox):
+                    if not _is_valid_pdf_table(rows, bbox):
                         continue
                     units.append(
                         _make_table_unit(
@@ -795,9 +949,63 @@ def _pdf_table_units(content: bytes) -> list[ExtractedUnit]:
                             },
                         )
                     )
+                    page_table_count += 1
+                if page_table_count:
+                    continue
+                for rows in _pdf_text_strategy_tables(page):
+                    units.append(
+                        _make_table_unit(
+                            len(units) + 1,
+                            rows,
+                            "pdf",
+                            {
+                                "page": page_number,
+                                "order": (page_number * 10_000) + 9_000 + page_table_count,
+                            },
+                        )
+                    )
+                    page_table_count += 1
         return units
     except Exception:
         return []
+
+
+def _pdf_text_strategy_tables(page: object) -> list[list[list[str]]]:
+    tables: list[list[list[str]]] = []
+    settings_options = [
+        {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+        },
+    ]
+    seen: set[str] = set()
+    for settings in settings_options:
+        try:
+            extracted = page.extract_tables(table_settings=settings) or []
+        except Exception:
+            continue
+        for table in extracted:
+            rows = _repair_pdf_table_rows(_clean_table_rows(table))
+            if not _is_valid_text_strategy_pdf_table(rows):
+                continue
+            key = "\n".join("|".join(row) for row in rows)
+            if key in seen:
+                continue
+            seen.add(key)
+            tables.append(rows)
+    return tables
 
 
 def _docx_table_units(content: bytes) -> list[ExtractedUnit]:
@@ -918,6 +1126,73 @@ def _clean_table_cell(cell: object | None) -> str:
     return text
 
 
+def _repair_pdf_table_rows(rows: list[list[str]]) -> list[list[str]]:
+    if not rows:
+        return rows
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count != 3:
+        return rows
+
+    numeric_first_cells = sum(1 for row in rows if row and re.match(r"^\s*\d+\b", row[0]))
+    if numeric_first_cells < max(3, len(rows) // 3):
+        return rows
+
+    repaired: list[list[str]] = []
+    for row in rows:
+        padded = row + [""] * (column_count - len(row))
+        first = padded[0].strip()
+        rest = [cell.strip() for cell in padded[1:] if cell.strip()]
+
+        header_text = " ".join(cell for cell in padded if cell.strip())
+        if re.search(r"\bsr\.?\s*no\.?\b", header_text, re.IGNORECASE):
+            repaired.append(["SR. NO.", re.sub(r"\bsr\.?\s*no\.?\b", "", header_text, flags=re.IGNORECASE).strip() or "CONTENTS"])
+            continue
+
+        numbered = re.match(r"^(\d+)\s*(.*)$", first)
+        if numbered:
+            number = numbered.group(1)
+            first_fragment = numbered.group(2).strip()
+            content = _join_pdf_table_fragments([first_fragment, *rest])
+            repaired.append([number, content])
+        elif first or rest:
+            repaired.append(["", _join_pdf_table_fragments([first, *rest])])
+
+    return _clean_table_rows(repaired)
+
+
+def _join_pdf_table_fragments(parts: list[str]) -> str:
+    text = ""
+    for part in [item.strip() for item in parts if item.strip()]:
+        if not text:
+            text = part
+            continue
+
+        first_token, _, remainder = part.partition(" ")
+        previous_match = re.search(r"([A-Za-z]{1,8})$", text)
+        previous_token = previous_match.group(1) if previous_match else ""
+
+        if previous_token.isupper() and first_token.isupper() and (
+            len(first_token) == 1 or len(previous_token) <= 3
+        ):
+            text = text[: -len(previous_token)] + previous_token + first_token
+            if remainder:
+                text = f"{text} {remainder}"
+        elif (
+            previous_token
+            and previous_token[:1].isupper()
+            and first_token.islower()
+            and 2 <= len(first_token) <= 5
+            and len(previous_token) <= 6
+        ):
+            text = text[: -len(previous_token)] + previous_token + first_token
+            if remainder:
+                text = f"{text} {remainder}"
+        else:
+            text = f"{text} {part}"
+
+    return text
+
+
 def _is_valid_table(rows: list[list[str]]) -> bool:
     if len(rows) < 2:
         return False
@@ -928,20 +1203,101 @@ def _is_valid_table(rows: list[list[str]]) -> bool:
     return filled_cells >= max(4, column_count + 1)
 
 
-def _is_valid_pdf_table(rows: list[list[str]], bbox: tuple[float, float, float, float]) -> bool:
-    if not rows:
-        return False
-    if _table_bbox_is_too_large(bbox):
+def _is_valid_text_strategy_pdf_table(rows: list[list[str]]) -> bool:
+    if not _is_valid_pdf_table(rows):
         return False
     column_count = max((len(row) for row in rows), default=0)
-    single_cell_rows = sum(1 for row in rows if sum(1 for cell in row if cell.strip()) <= 1)
-    if single_cell_rows / len(rows) > 0.35:
+    if column_count > 5:
         return False
-    prose_like = sum(1 for row in rows for cell in row if len(cell.split()) > 16)
-    filled_cells = sum(1 for row in rows for cell in row if cell)
-    if filled_cells and prose_like / filled_cells > 0.25:
+
+    filled_rows = [[cell for cell in row if cell.strip()] for row in rows]
+    if not filled_rows:
         return False
-    return column_count >= 2
+    dense_rows = sum(1 for row in filled_rows if len(row) >= max(2, column_count - 1))
+    if dense_rows / len(filled_rows) < 0.55:
+        return False
+
+    filled_cells = [cell.strip() for row in rows for cell in row if cell.strip()]
+    short_fragments = [
+        cell
+        for cell in filled_cells
+        if re.fullmatch(r"[A-Za-z]{1,3}", cell) or re.fullmatch(r"[a-z]{4,8}", cell)
+    ]
+    if len(short_fragments) / len(filled_cells) > 0.35:
+        return False
+
+    header = [cell.strip() for cell in rows[0] if cell.strip()]
+    return len(header) >= 2 and any(len(cell.split()) > 1 or len(cell) >= 6 for cell in header)
+
+
+def _is_valid_pdf_table(rows: list[list[str]], bbox: tuple[float, float, float, float] | None = None) -> bool:
+    if not _is_valid_table(rows):
+        return False
+    if bbox and _table_bbox_is_too_large(bbox):
+        return False
+
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count >= 6 and len(rows) >= 10:
+        return False
+
+    filled_cells = [cell.strip() for row in rows for cell in row if cell.strip()]
+    if not filled_cells:
+        return False
+
+    short_fragments = [
+        cell
+        for cell in filled_cells
+        if re.fullmatch(r"[A-Za-z]{1,3}", cell) or re.fullmatch(r"[a-z]{4,8}", cell)
+    ]
+    if len(short_fragments) / len(filled_cells) > 0.25:
+        return False
+
+    if _looks_like_fragmented_prose_table(rows):
+        return False
+
+    first_row_text = " ".join(cell for cell in rows[0] if cell.strip())
+    if first_row_text and first_row_text[:1].islower() and len(first_row_text.split()) > 5:
+        return False
+
+    prose_like_cells = [cell for cell in filled_cells if len(cell.split()) > 16]
+    return len(prose_like_cells) / len(filled_cells) <= 0.2
+
+
+def _looks_like_fragmented_prose_table(rows: list[list[str]]) -> bool:
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count < 4 or len(rows) < 8:
+        return False
+
+    filled_cells = [cell.strip() for row in rows for cell in row if cell.strip()]
+    if not filled_cells:
+        return False
+
+    fragment_cells = 0
+    lower_start_cells = 0
+    sentence_end_cells = 0
+    for cell in filled_cells:
+        words = cell.split()
+        if len(words) <= 3 and re.search(r"[A-Za-z]", cell):
+            fragment_cells += 1
+        if cell[:1].islower():
+            lower_start_cells += 1
+        if re.search(r"[.!?:;]$", cell):
+            sentence_end_cells += 1
+
+    fragment_ratio = fragment_cells / len(filled_cells)
+    lower_start_ratio = lower_start_cells / len(filled_cells)
+    sentence_end_ratio = sentence_end_cells / len(filled_cells)
+    header = " ".join(cell for cell in rows[0] if cell.strip())
+    generic_headers = sum(1 for cell in rows[0] if re.fullmatch(r"Column\s+\d+", cell.strip(), re.IGNORECASE))
+
+    if generic_headers >= 2 and column_count >= 4 and len(rows) >= 6:
+        return True
+
+    return (
+        fragment_ratio > 0.7
+        and (lower_start_ratio > 0.25 or sentence_end_ratio > 0.25)
+        and not re.search(r"\b(sr\.?\s*no|metric|target|shift|timing|break|contents)\b", header, re.IGNORECASE)
+    )
 
 
 def _table_bbox_is_too_large(bbox: tuple[float, float, float, float]) -> bool:

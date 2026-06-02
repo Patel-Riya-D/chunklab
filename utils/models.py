@@ -58,6 +58,7 @@ class RetrievalResult:
     chunk: Chunk
     score: float
     rank: int
+    score_details: dict[str, float | str] = field(default_factory=dict)
 
 
 @dataclass

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 import streamlit as st
 
@@ -24,6 +26,31 @@ def _show_table_rows(rows: object) -> bool:
     return True
 
 
+def _table_rows_from_text(text: str) -> list[list[str]]:
+    rows = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or "|" not in stripped.strip("|"):
+            continue
+        cells = [cell.strip().replace("\\|", "|") for cell in stripped.strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells if cell):
+            continue
+        if len([cell for cell in cells if cell]) >= 2:
+            rows.append(cells)
+    if len(rows) < 2:
+        return []
+    column_count = max(len(row) for row in rows)
+    return [row + [""] * (column_count - len(row)) for row in rows]
+
+
+def _show_table_text(text: str) -> bool:
+    rows = _table_rows_from_text(text)
+    if not rows:
+        return False
+    st.table(_table_dataframe(rows))
+    return True
+
+
 def _show_text(unit_type: str, text: str) -> None:
     if unit_type in {"code_symbol", "code_context"}:
         st.code(text, language="python")
@@ -41,7 +68,7 @@ def show_units(units: list[ExtractedUnit], depth: int = 0) -> None:
             if unit.metadata:
                 visible_metadata = {key: value for key, value in unit.metadata.items() if key != "rows"}
                 st.caption(", ".join(f"{key}: {value}" for key, value in visible_metadata.items()))
-            if not _show_table_rows(unit.metadata.get("rows")):
+            if not _show_table_rows(unit.metadata.get("rows")) and not _show_table_text(unit.text):
                 _show_text(unit.unit_type, unit.text)
             if unit.children:
                 show_units(unit.children, depth + 1)
@@ -65,17 +92,60 @@ def chunk_table(chunks: list[Chunk]) -> pd.DataFrame:
     )
 
 
+def _chunk_role(chunk: Chunk) -> str:
+    role = str(chunk.metadata.get("chunk_role", chunk.metadata.get("role", ""))).lower()
+    if role:
+        return role
+    if chunk.parent_id:
+        return "child"
+    if chunk.children:
+        return "parent"
+    return "chunk"
+
+
+def _chunk_title(chunk: Chunk) -> str:
+    return str(chunk.metadata.get("title") or chunk.metadata.get("section_path") or chunk.metadata.get("source_unit") or chunk.id)
+
+
+def _page_label(chunk: Chunk) -> str:
+    page = chunk.metadata.get("page")
+    return f" | page {page}" if page else ""
+
+
+def _relationship_summary(chunk: Chunk) -> str:
+    role = _chunk_role(chunk)
+    if role == "parent":
+        child_ids = ", ".join(chunk.children[:4])
+        if len(chunk.children) > 4:
+            child_ids += f", +{len(chunk.children) - 4} more"
+        return f"Parent chunk | children: {len(chunk.children)}" + (f" | {child_ids}" if child_ids else "")
+    if role == "child":
+        return f"Child chunk | parent: {chunk.parent_id or chunk.metadata.get('parent_chunk_id', '')}"
+    return "Standalone chunk"
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _format_score_details(details: dict[str, float | str], hidden_keys: set[str]) -> str:
+    return ", ".join(f"{key}: {value}" for key, value in details.items() if key not in hidden_keys)
+
+
+def _write_text_or_table(chunk: Chunk, text: str | None = None) -> None:
+    content = chunk.text if text is None else text
+    if not _show_table_rows(chunk.metadata.get("rows")) and not _show_table_text(content):
+        st.write(_compact_text(content))
+
+
 def show_chunk(chunk: Chunk, index: int | None = None, total: int | None = None) -> None:
     with st.container(border=True):
-        role = str(chunk.metadata.get("chunk_role", chunk.metadata.get("role", ""))).lower()
+        role = _chunk_role(chunk)
         role_label = "Parent" if role == "parent" else "Child" if role == "child" else "Chunk"
         prefix = f"Chunk {index} of {total} - " if index is not None and total is not None else ""
-        label = f"{prefix}{role_label}: {chunk.id} | {len(chunk.text)} chars"
-        if chunk.parent_id:
-            label += f" | child of {chunk.parent_id}"
-        if chunk.children:
-            label += f" | {len(chunk.children)} children"
+        label = f"{prefix}{role_label.upper()} | {chunk.id}"
         st.markdown(f"**{label}**")
+        st.caption(_relationship_summary(chunk))
         cols = st.columns(5)
         cols[0].metric("Role", role_label)
         cols[1].metric("Characters", len(chunk.text))
@@ -97,16 +167,85 @@ def show_chunk(chunk: Chunk, index: int | None = None, total: int | None = None)
             meta_parts.append(f"source: {chunk.metadata['source_unit']}")
         if meta_parts:
             st.caption(" | ".join(meta_parts))
-        if not _show_table_rows(chunk.metadata.get("rows")):
+        if not _show_table_rows(chunk.metadata.get("rows")) and not _show_table_text(chunk.text):
             _show_text("code_symbol" if chunk.strategy_id == "code_function" else "", chunk.text)
 
 
 def show_retrieved(results: list[RetrievalResult]) -> None:
+    expanded_parent_ids = {
+        str(result.score_details.get("expanded_parent"))
+        for result in results
+        if result.score_details.get("expanded_parent")
+    }
+    hidden_keys = {
+        "retrieved_role",
+        "matched_child",
+        "expanded_parent",
+        "expanded_parent_source",
+        "expanded_parent_children",
+        "expanded_parent_text",
+        "expanded_parent_rank",
+        "expanded_parent_score",
+        "expanded_parent_score_details",
+        "matched_parent",
+        "parent_children",
+    }
     for result in results:
+        chunk = result.chunk
+        role = str(result.score_details.get("retrieved_role") or _chunk_role(chunk)).lower()
+        if role == "parent" and chunk.id in expanded_parent_ids:
+            continue
+        title = _chunk_title(chunk)
+        page_label = _page_label(chunk)
+        role_label = "Parent" if role == "parent" else "Child" if role == "child" else "Chunk"
         with st.container(border=True):
-            st.markdown(f"**Rank {result.rank}: {result.chunk.id} | score {result.score:.3f}**")
-            if result.chunk.metadata:
-                visible_metadata = {key: value for key, value in result.chunk.metadata.items() if key != "rows"}
-                st.caption(", ".join(f"{key}: {value}" for key, value in visible_metadata.items()))
-            if not _show_table_rows(result.chunk.metadata.get("rows")):
-                _show_text("code_symbol" if result.chunk.strategy_id == "code_function" else "", result.chunk.text)
+            st.markdown(f"**Rank {result.rank}**")
+
+            if role == "child" and result.score_details.get("expanded_parent"):
+                st.markdown("**Matched Child Chunk**")
+                st.caption(f"Chunk ID: {chunk.id}")
+                _write_text_or_table(chunk)
+                st.caption(f"Score: {result.score:.3f}")
+                trace = (
+                    f"matched child: {result.score_details.get('matched_child', chunk.id)} | "
+                    f"expanded parent: {result.score_details['expanded_parent']}"
+                )
+                if result.score_details.get("expanded_parent_source"):
+                    trace += f" | parent source: {result.score_details['expanded_parent_source']}"
+                st.caption(trace)
+                details = _format_score_details(result.score_details, hidden_keys)
+                if details:
+                    st.caption(details)
+
+                st.divider()
+                st.markdown("**Expanded Parent Chunk**")
+                st.caption(f"Parent ID: {result.score_details['expanded_parent']}")
+                parent_text = str(result.score_details.get("expanded_parent_text", "")).strip()
+                if parent_text:
+                    st.write(_compact_text(parent_text))
+                if result.score_details.get("expanded_parent_score"):
+                    st.caption(f"Score: {result.score_details['expanded_parent_score']}")
+                parent_trace = []
+                if result.score_details.get("expanded_parent_rank"):
+                    parent_trace.append(f"retrieved rank: {result.score_details['expanded_parent_rank']}")
+                parent_trace.append(f"matched parent: {result.score_details['expanded_parent']}")
+                if result.score_details.get("expanded_parent_children"):
+                    parent_trace.append(f"children: {result.score_details['expanded_parent_children']}")
+                st.caption(" | ".join(parent_trace))
+                if result.score_details.get("expanded_parent_score_details"):
+                    st.caption(str(result.score_details["expanded_parent_score_details"]))
+            else:
+                st.markdown(f"**{role_label} match | {title}{page_label}**")
+                st.caption(f"Chunk ID: {chunk.id}")
+                _write_text_or_table(chunk)
+                st.caption(f"Score: {result.score:.3f}")
+                trace_parts = []
+                if result.score_details.get("matched_parent"):
+                    trace_parts.append(f"matched parent: {result.score_details['matched_parent']}")
+                if result.score_details.get("parent_children"):
+                    trace_parts.append(f"children: {result.score_details['parent_children']}")
+                if trace_parts:
+                    st.caption(" | ".join(trace_parts))
+                details = _format_score_details(result.score_details, hidden_keys)
+                if details:
+                    st.caption(details)

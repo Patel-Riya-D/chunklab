@@ -25,12 +25,20 @@ class AzureAnswerGenerator:
         contexts = []
         for result in retrieved:
             title = result.chunk.metadata.get("title", "untitled")
-            contexts.append(
+            context = (
                 f"Chunk ID: {result.chunk.id}\n"
                 f"Title: {title}\n"
                 f"Score: {result.score:.3f}\n"
                 f"Text:\n{result.chunk.text}"
             )
+            if result.score_details.get("expanded_parent") and result.score_details.get("expanded_parent_text"):
+                context += (
+                    "\n\nExpanded parent chunk:\n"
+                    f"Parent ID: {result.score_details['expanded_parent']}\n"
+                    f"Parent source: {result.score_details.get('expanded_parent_source', '')}\n"
+                    f"Parent text:\n{result.score_details['expanded_parent_text']}"
+                )
+            contexts.append(context)
 
         messages = [
             {
@@ -38,8 +46,9 @@ class AzureAnswerGenerator:
                 "content": (
                     "You are a document retrieval assistant. Answer the user's question directly using only "
                     "the provided retrieved chunks. If the answer is not supported by the chunks, say that "
-                    "the retrieved context does not contain enough information. Keep the answer concise, "
-                    "then include a short 'Context used' line with chunk IDs."
+                    "the retrieved context does not contain enough information. Do not use outside knowledge. "
+                    "Keep the answer concise, preserve table/list values when relevant, then include a short "
+                    "'Context used' line with chunk IDs."
                 ),
             },
             {

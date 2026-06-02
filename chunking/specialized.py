@@ -48,6 +48,8 @@ class CodeFunctionChunker(BaseChunker):
         for unit in extraction.units:
             if unit.unit_type in {"code_symbol", "code_context"}:
                 chunks.append(self.make_chunk(len(chunks) + 1, unit.text, {"symbol": unit.metadata.get("symbol"), **unit.metadata}))
+            elif unit.unit_type == "table":
+                chunks.append(self.make_chunk(len(chunks) + 1, _contextual_text(unit), _base_metadata(unit)))
         if chunks:
             return chunks
         pattern = re.compile(r"^\s*(?:async\s+)?(?:def|class|function)\s+([A-Za-z_][\w]*)", re.MULTILINE)

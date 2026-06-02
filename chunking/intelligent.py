@@ -4,9 +4,17 @@ import re
 
 from chunking.base import BaseChunker
 from chunking.core import RecursiveChunker
-from chunking.structure import LayoutAwareChunker
+from chunking.structure import LayoutAwareChunker, _base_metadata, _flatten_units, _contextual_text
 from utils.models import Chunk, ExtractionResult
 from utils.text import split_sentences
+
+
+def _table_chunks(chunker: BaseChunker, extraction: ExtractionResult, start_index: int) -> list[Chunk]:
+    chunks = []
+    for unit in _flatten_units(extraction.units):
+        if unit.unit_type == "table" and unit.text.strip():
+            chunks.append(chunker.make_chunk(start_index + len(chunks), _contextual_text(unit), _base_metadata(unit)))
+    return chunks
 
 
 class SemanticChunker(BaseChunker):
@@ -24,6 +32,7 @@ class SemanticChunker(BaseChunker):
             text = " ".join(sentences[start : start + span])
             if text:
                 chunks.append(self.make_chunk(len(chunks) + 1, text, {"sentence_start": start + 1, "sentence_end": start + span}))
+        chunks.extend(_table_chunks(self, extraction, len(chunks) + 1))
         return chunks or RecursiveChunker().chunk(extraction, config)
 
 
@@ -48,5 +57,6 @@ class ClauseAwareChunker(BaseChunker):
 
     def chunk(self, extraction: ExtractionResult, config: dict | None = None) -> list[Chunk]:
         clauses = [c.strip() for c in re.split(r"(?:(?<=;)|\n\s*(?:\([a-z0-9]+\)|[a-z0-9]+\.)\s+)", extraction.text) if c.strip()]
-        return [self.make_chunk(idx, clause, {"clause": idx}) for idx, clause in enumerate(clauses, start=1)]
-
+        chunks = [self.make_chunk(idx, clause, {"clause": idx}) for idx, clause in enumerate(clauses, start=1)]
+        chunks.extend(_table_chunks(self, extraction, len(chunks) + 1))
+        return chunks

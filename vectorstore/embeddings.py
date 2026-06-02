@@ -76,7 +76,7 @@ class AzureOpenAIEmbedder:
         return [list(map(float, item.embedding)) for item in response.data]
 
 
-def get_default_embedder(prefer_sentence_transformers: bool = False) -> Embedder:
+def get_default_embedder(prefer_sentence_transformers: bool = True) -> Embedder:
     try:
         return AzureOpenAIEmbedder()
     except Exception:
