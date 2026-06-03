@@ -14,6 +14,35 @@ from utils.document import human_size, make_uploaded_document
 
 st.set_page_config(page_title="ChunkLab", page_icon="CL", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .stMain .block-container {
+        padding-bottom: 2rem !important;
+    }
+    section[data-testid="stBottom"] {
+        background: transparent !important;
+        border: 0 !important;
+        padding: 0 !important;
+        min-height: 0 !important;
+    }
+    section[data-testid="stBottom"] > div {
+        width: 100% !important;
+        margin: 0 !important;
+    }
+    [data-testid="stChatInput"] {
+        width: 100% !important;
+        margin: 0 !important;
+        background: rgb(14, 17, 23) !important;
+        padding: 0.25rem !important;
+        border-radius: 0.5rem !important;
+        box-shadow: 0 -0.5rem 1rem rgba(14, 17, 23, 0.75);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def init_state() -> None:
     defaults = {
@@ -23,6 +52,7 @@ def init_state() -> None:
         "assistant": RAGAssistant(),
         "chat_history": [],
         "last_strategy": None,
+        "pending_question": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -33,6 +63,7 @@ def reset_downstream() -> None:
     st.session_state.extraction_result = None
     st.session_state.chunks = []
     st.session_state.chat_history = []
+    st.session_state.pending_question = None
     st.session_state.assistant = RAGAssistant()
 
 
@@ -64,46 +95,40 @@ st.title("ChunkLab")
 st.caption("Document intelligence, chunking visualization, and retrieval evaluation in one modular Streamlit platform.")
 
 with st.sidebar:
-    st.header("Pipeline")
+    st.header("Pipeline Status")
     st.write("Upload -> Extract -> Chunk -> Index -> Retrieve")
+    st.divider()
+
     if st.session_state.document:
-        st.success(st.session_state.document.name)
+        st.success(f"Document loaded: {st.session_state.document.name}")
+    else:
+        st.info("No document uploaded.")
+
     if st.session_state.extraction_result:
-        st.info(st.session_state.extraction_result.method_name)
+        st.info(f"Extraction: {st.session_state.extraction_result.method_name}")
+    else:
+        st.warning("Extraction not run.")
+
     if st.session_state.chunks:
-        st.metric("Chunks", len(st.session_state.chunks))
+        st.metric("Indexed Chunks", len(st.session_state.chunks))
+    else:
+        st.warning("No chunks generated.")
 
 document_tab, assistant_tab = st.tabs(["Document Lab", "Retrieval Assistant"])
 
 with document_tab:
-    st.header("Upload, Extraction, Chunking, and Preview")
+    st.header("Document Processing Pipeline")
 
-    st.subheader("1. Upload")
+    # Step 1
+    st.subheader("Step 1 — Upload")
     uploaded_file = st.file_uploader(
         "Choose a document",
         type=[
-            "pdf",
-            "docx",
-            "txt",
-            "md",
-            "markdown",
-            "html",
-            "htm",
-            "py",
-            "js",
-            "ts",
-            "tsx",
-            "jsx",
-            "java",
-            "go",
-            "rs",
-            "cpp",
-            "c",
-            "h",
-            "cs",
-            "php",
-            "rb",
+            "pdf", "docx", "txt", "md", "markdown", "html", "htm",
+            "py", "js", "ts", "tsx", "jsx", "java", "go", "rs",
+            "cpp", "c", "h", "cs", "php", "rb",
         ],
+        label_visibility="collapsed",
     )
     if uploaded_file:
         content = uploaded_file.getvalue()
@@ -123,15 +148,17 @@ with document_tab:
         st.info("Upload a PDF, DOCX, TXT, Markdown, HTML, or code file to begin.")
 
     st.divider()
-    st.subheader("2. Extraction")
+
+    # Step 2
+    st.subheader("Step 2 — Extraction")
     if not st.session_state.document:
         st.warning("Upload a document first.")
     else:
         method_labels = {extractor.name: method_id for method_id, extractor in EXTRACTION_REGISTRY.items()}
-        selected_label = st.radio("Extraction method", list(method_labels.keys()))
+        selected_label = st.radio("Extraction method", list(method_labels.keys()), horizontal=True)
         method_id = method_labels[selected_label]
         extractor = get_extractor(method_id)
-        st.write(extractor.description)
+        st.caption(extractor.description)
 
         compatible = compatible_chunkers(method_id)
         st.info("Compatible chunkers: " + ", ".join(CHUNKING_STRATEGIES[item] for item in compatible))
@@ -141,6 +168,7 @@ with document_tab:
                 st.session_state.extraction_result = extractor.extract(st.session_state.document)
                 st.session_state.chunks = []
                 st.session_state.chat_history = []
+                st.session_state.pending_question = None
                 st.session_state.assistant = RAGAssistant()
 
         result = st.session_state.extraction_result
@@ -154,17 +182,19 @@ with document_tab:
             show_units(result.units)
 
     st.divider()
-    st.subheader("3. Chunking")
+
+    # Step 3
+    st.subheader("Step 3 — Chunking")
     result = st.session_state.extraction_result
     if not result:
         st.warning("Run extraction first.")
     else:
         compatible = compatible_chunkers(result.method_id)
         options = {CHUNKING_STRATEGIES[item]: item for item in compatible}
-        selected = st.radio("Compatible chunking strategy", list(options.keys()))
+        selected = st.radio("Compatible chunking strategy", list(options.keys()), horizontal=True)
         strategy_id = options[selected]
         chunker = get_chunker(strategy_id)
-        st.write(chunker.description)
+        st.caption(chunker.description)
 
         settings = strategy_settings(strategy_id)
         if st.button("Generate Chunks", type="primary"):
@@ -175,6 +205,7 @@ with document_tab:
                 st.session_state.assistant = RAGAssistant()
                 st.session_state.assistant.build_index(chunks)
                 st.session_state.chat_history = []
+                st.session_state.pending_question = None
             st.success(f"Generated and indexed {len(st.session_state.chunks)} chunks.")
 
         if st.session_state.chunks:
@@ -186,12 +217,17 @@ with document_tab:
             cols[3].metric("Children", metrics["child_chunks"])
 
     st.divider()
-    st.subheader("4. Chunk Preview")
+
+    # Step 4
+    st.subheader("Step 4 — Chunk Preview")
     chunks = st.session_state.chunks
     if not chunks:
         st.warning("Generate chunks first.")
     else:
-        parent_child_rows = [{"parent": chunk.id, "children": ", ".join(chunk.children)} for chunk in chunks if chunk.children]
+        parent_child_rows = [
+            {"parent": chunk.id, "children": ", ".join(chunk.children)}
+            for chunk in chunks if chunk.children
+        ]
         if parent_child_rows:
             st.subheader("Parent-Child Relationships")
             st.dataframe(pd.DataFrame(parent_child_rows), use_container_width=True, hide_index=True)
@@ -202,26 +238,60 @@ with document_tab:
 
 with assistant_tab:
     st.header("Retrieval Assistant")
+
     if not st.session_state.chunks:
-        st.warning("Generate chunks before using the assistant.")
+        st.warning("Generate and index chunks in the Document Lab before using the assistant.")
     else:
-        top_k = st.slider("Retrieved chunks", 1, min(10, len(st.session_state.chunks)), min(5, len(st.session_state.chunks)))
-        answer_mode_label = st.radio(
-            "Answer mode",
-            ["LLM from retrieved chunks", "Extractive, no LLM"],
-            horizontal=True,
-        )
+        with st.expander("Retrieval settings", expanded=False):
+            top_k = st.slider(
+                "Retrieved chunks",
+                1,
+                min(10, len(st.session_state.chunks)),
+                min(5, len(st.session_state.chunks)),
+            )
+            answer_mode_label = st.radio(
+                "Answer mode",
+                ["LLM from retrieved chunks", "Extractive, no LLM"],
+                horizontal=True,
+            )
         answer_mode = "llm" if answer_mode_label == "LLM from retrieved chunks" else "extractive"
+
+        message_area = st.container(height=470, border=False)
+        with message_area:
+            if not st.session_state.chat_history and not st.session_state.pending_question:
+                st.caption("Ask a question below to evaluate retrieval quality.")
+            for turn in st.session_state.chat_history:
+                with st.chat_message("user"):
+                    st.write(turn.question)
+                with st.chat_message("assistant"):
+                    st.markdown(turn.answer)
+                    with st.expander(
+                        f"Retrieved chunks ({len(turn.retrieved)}) — {turn.latency_ms:.1f} ms",
+                        expanded=False,
+                    ):
+                        show_retrieved(turn.retrieved)
+
+            if st.session_state.pending_question:
+                pending_question = st.session_state.pending_question
+                with st.chat_message("user"):
+                    st.write(pending_question)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        turn = st.session_state.assistant.answer(
+                            pending_question,
+                            top_k=top_k,
+                            answer_mode=answer_mode,
+                        )
+                    st.markdown(turn.answer)
+                    with st.expander(
+                        f"Retrieved chunks ({len(turn.retrieved)}) — {turn.latency_ms:.1f} ms",
+                        expanded=False,
+                    ):
+                        show_retrieved(turn.retrieved)
+                st.session_state.chat_history.append(turn)
+                st.session_state.pending_question = None
+
         question = st.chat_input("Ask a question to evaluate retrieval quality")
         if question:
-            with st.spinner("Retrieving relevant chunks..."):
-                turn = st.session_state.assistant.answer(question, top_k=top_k, answer_mode=answer_mode)
-                st.session_state.chat_history.append(turn)
-
-        for turn in st.session_state.chat_history:
-            with st.chat_message("user"):
-                st.write(turn.question)
-            with st.chat_message("assistant"):
-                st.markdown(turn.answer)
-                with st.expander(f"Retrieved chunks ({len(turn.retrieved)}) for: {turn.question} | {turn.latency_ms:.1f} ms", expanded=False):
-                    show_retrieved(turn.retrieved)
+            st.session_state.pending_question = question
+            st.rerun()

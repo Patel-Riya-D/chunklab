@@ -189,7 +189,7 @@ class InMemoryVectorStore:
     semantic_weight: float = 0.65
     bm25_weight: float = 0.20
     lexical_weight: float = 0.10
-    intent_weight: float = 0.05
+    intent_weight: float = 0.08
 
     def build(self, chunks: list[Chunk]) -> None:
         retrievable = [chunk for chunk in chunks if chunk.text.strip()]

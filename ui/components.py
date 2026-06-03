@@ -172,15 +172,12 @@ def show_chunk(chunk: Chunk, index: int | None = None, total: int | None = None)
 
 
 def show_retrieved(results: list[RetrievalResult]) -> None:
-    expanded_parent_ids = {
-        str(result.score_details.get("expanded_parent"))
-        for result in results
-        if result.score_details.get("expanded_parent")
-    }
     hidden_keys = {
         "retrieved_role",
         "matched_child",
         "expanded_parent",
+        "retrieval_level",
+        "expansion_level",
         "expanded_parent_source",
         "expanded_parent_children",
         "expanded_parent_text",
@@ -190,26 +187,26 @@ def show_retrieved(results: list[RetrievalResult]) -> None:
         "matched_parent",
         "parent_children",
     }
-    for result in results:
+    visible_results = [
+        result
+        for result in results
+        if str(result.score_details.get("retrieved_role") or _chunk_role(result.chunk)).lower() != "parent"
+    ]
+    for display_rank, result in enumerate(visible_results, start=1):
         chunk = result.chunk
         role = str(result.score_details.get("retrieved_role") or _chunk_role(chunk)).lower()
-        if role == "parent" and chunk.id in expanded_parent_ids:
-            continue
         title = _chunk_title(chunk)
         page_label = _page_label(chunk)
         role_label = "Parent" if role == "parent" else "Child" if role == "child" else "Chunk"
         with st.container(border=True):
-            st.markdown(f"**Rank {result.rank}**")
+            st.markdown(f"**Rank {display_rank}**")
 
             if role == "child" and result.score_details.get("expanded_parent"):
                 st.markdown("**Matched Child Chunk**")
                 st.caption(f"Chunk ID: {chunk.id}")
                 _write_text_or_table(chunk)
-                st.caption(f"Score: {result.score:.3f}")
-                trace = (
-                    f"matched child: {result.score_details.get('matched_child', chunk.id)} | "
-                    f"expanded parent: {result.score_details['expanded_parent']}"
-                )
+                st.caption(f"Child Similarity Score: {result.score:.3f}")
+                trace = f"retrieval level: child | expansion level: parent"
                 if result.score_details.get("expanded_parent_source"):
                     trace += f" | parent source: {result.score_details['expanded_parent_source']}"
                 st.caption(trace)
@@ -223,17 +220,11 @@ def show_retrieved(results: list[RetrievalResult]) -> None:
                 parent_text = str(result.score_details.get("expanded_parent_text", "")).strip()
                 if parent_text:
                     st.write(_compact_text(parent_text))
-                if result.score_details.get("expanded_parent_score"):
-                    st.caption(f"Score: {result.score_details['expanded_parent_score']}")
                 parent_trace = []
-                if result.score_details.get("expanded_parent_rank"):
-                    parent_trace.append(f"retrieved rank: {result.score_details['expanded_parent_rank']}")
-                parent_trace.append(f"matched parent: {result.score_details['expanded_parent']}")
+                parent_trace.append(f"expanded from child: {result.score_details.get('matched_child', chunk.id)}")
                 if result.score_details.get("expanded_parent_children"):
                     parent_trace.append(f"children: {result.score_details['expanded_parent_children']}")
                 st.caption(" | ".join(parent_trace))
-                if result.score_details.get("expanded_parent_score_details"):
-                    st.caption(str(result.score_details["expanded_parent_score_details"]))
             else:
                 st.markdown(f"**{role_label} match | {title}{page_label}**")
                 st.caption(f"Chunk ID: {chunk.id}")

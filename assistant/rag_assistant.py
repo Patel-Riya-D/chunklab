@@ -19,9 +19,10 @@ class RAGAssistant:
     chunks_by_id: dict[str, Chunk] = field(default_factory=dict)
 
     def build_index(self, chunks: list[Chunk]) -> None:
-        self.retriever.index(chunks)
         self.chunks_by_id = {chunk.id: chunk for chunk in chunks}
-        self.indexed_chunk_count = len([chunk for chunk in chunks if chunk.text.strip()])
+        retrieval_chunks = self._retrieval_chunks(chunks)
+        self.retriever.index(retrieval_chunks)
+        self.indexed_chunk_count = len([chunk for chunk in retrieval_chunks if chunk.text.strip()])
         self.term_document_frequency = Counter()
         for chunk in chunks:
             terms = self._expanded_terms(self._chunk_support_text(chunk))
@@ -74,10 +75,15 @@ class RAGAssistant:
         return generated or "Answer: The retrieved context did not contain enough information."
 
     def _best_answer_result(self, question: str, retrieved: list[RetrievalResult]) -> RetrievalResult:
+        scored = []
         for result in retrieved:
-            if self._has_answer_support(question, self._answer_context_chunk(result.chunk)):
-                return result
-        return retrieved[0]
+            chunk = self._answer_context_chunk(result.chunk)
+            answerability = self._answerability_score(question, chunk)
+            support = self._has_answer_support(question, chunk)
+            score = answerability + (0.10 * result.score) + (0.15 if support else 0.0)
+            scored.append((score, result))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1] if scored else retrieved[0]
 
     def _source_label(self, chunk: Chunk) -> str:
         title = str(chunk.metadata.get("title") or chunk.metadata.get("section_path") or chunk.metadata.get("source_unit") or chunk.id)
@@ -94,13 +100,20 @@ class RAGAssistant:
             return "parent"
         return "chunk"
 
+    def _retrieval_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        child_chunks = [
+            chunk
+            for chunk in chunks
+            if self._chunk_role(chunk) == "child" and chunk.parent_id and chunk.text.strip()
+        ]
+        return child_chunks or chunks
+
     def _answer_context_chunk(self, chunk: Chunk) -> Chunk:
         if self._chunk_role(chunk) == "child" and chunk.parent_id:
             return self.chunks_by_id.get(chunk.parent_id, chunk)
         return chunk
 
     def _annotate_parent_child_results(self, results: list[RetrievalResult]) -> None:
-        result_by_chunk_id = {result.chunk.id: result for result in results}
         for result in results:
             chunk = result.chunk
             role = self._chunk_role(chunk)
@@ -109,23 +122,12 @@ class RAGAssistant:
                 parent = self.chunks_by_id.get(chunk.parent_id)
                 result.score_details["matched_child"] = chunk.id
                 result.score_details["expanded_parent"] = chunk.parent_id
+                result.score_details["retrieval_level"] = "child"
+                result.score_details["expansion_level"] = "parent"
                 if parent:
                     result.score_details["expanded_parent_source"] = self._source_label(parent)
                     result.score_details["expanded_parent_children"] = str(len(parent.children))
                     result.score_details["expanded_parent_text"] = parent.text
-                    parent_result = result_by_chunk_id.get(parent.id)
-                    if parent_result:
-                        result.score_details["expanded_parent_rank"] = str(parent_result.rank)
-                        result.score_details["expanded_parent_score"] = f"{parent_result.score:.3f}"
-                        parent_score_details = {
-                            key: value
-                            for key, value in parent_result.score_details.items()
-                            if key not in {"retrieved_role", "matched_parent", "parent_children"}
-                        }
-                        if parent_score_details:
-                            result.score_details["expanded_parent_score_details"] = ", ".join(
-                                f"{key}: {value}" for key, value in parent_score_details.items()
-                            )
             elif role == "parent":
                 result.score_details["matched_parent"] = chunk.id
                 result.score_details["parent_children"] = str(len(chunk.children))
@@ -223,6 +225,20 @@ class RAGAssistant:
             return [0.0 for _ in sentences]
         query_vector = vectors[0]
         return [cosine_similarity(query_vector, sentence_vector) for sentence_vector in vectors[1:]]
+
+    def _answerability_score(self, question: str, chunk: Chunk) -> float:
+        answerable_text = self._answerable_text(chunk)
+        question_terms = self._anchor_terms(self._important_terms(question))
+        sentences = self._answer_units(answerable_text)
+        if not sentences:
+            return 0.0
+
+        semantic_scores = self._semantic_sentence_scores(question, sentences)
+        best_sentence_score = max(semantic_scores, default=0.0)
+        chunk_terms = self._expanded_terms(self._chunk_support_text(chunk))
+        coverage = len(question_terms & chunk_terms) / max(1, len(question_terms))
+        table_bonus = 0.10 if isinstance(chunk.metadata.get("rows"), list) else 0.0
+        return (0.65 * best_sentence_score) + (0.30 * coverage) + table_bonus
 
     def _has_answer_support(self, question: str, chunk: Chunk) -> bool:
         question_terms = self._important_terms(question)
