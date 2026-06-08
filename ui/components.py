@@ -1,12 +1,114 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
+import html as html_lib
 import re
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-from utils.models import Chunk, ExtractedUnit, RetrievalResult
+from utils.models import Chunk, DocumentType, ExtractedUnit, RetrievalResult, UploadedDocument
 from utils.text import estimate_tokens
+
+
+_CODE_LANGUAGES = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".cpp": "cpp",
+    ".c": "c",
+    ".h": "c",
+    ".cs": "csharp",
+    ".php": "php",
+    ".rb": "ruby",
+}
+
+
+def _decode_document_text(document: UploadedDocument) -> str:
+    return document.content.decode("utf-8", errors="ignore")
+
+
+def _docx_text(content: bytes) -> str:
+    try:
+        from docx import Document
+    except Exception:
+        return ""
+
+    try:
+        doc = Document(BytesIO(content))
+    except Exception:
+        return ""
+
+    paragraphs = [paragraph.text.strip() for paragraph in doc.paragraphs if paragraph.text.strip()]
+    table_lines = []
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return "\n\n".join([*paragraphs, *table_lines]).strip()
+
+
+def show_original_document(document: UploadedDocument) -> None:
+    with st.expander("Original Document Preview", expanded=True):
+        st.download_button(
+            "Download original",
+            data=document.content,
+            file_name=document.name,
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+
+        if document.doc_type == DocumentType.PDF:
+            encoded_pdf = base64.b64encode(document.content).decode("ascii")
+            st.markdown(
+                f"""
+                <iframe
+                    src="data:application/pdf;base64,{encoded_pdf}"
+                    width="100%"
+                    height="760"
+                    style="border: 1px solid rgba(128, 128, 128, 0.35); border-radius: 8px;"
+                ></iframe>
+                """,
+                unsafe_allow_html=True,
+            )
+            return
+
+        if document.doc_type == DocumentType.DOCX:
+            preview_text = _docx_text(document.content)
+            st.caption("DOCX is shown as readable text; use download to open the original formatted file.")
+            if preview_text:
+                st.text_area("DOCX text preview", preview_text, height=520, label_visibility="collapsed")
+            else:
+                st.info("No readable DOCX text preview could be generated.")
+            return
+
+        text = _decode_document_text(document)
+        if document.doc_type == DocumentType.MD:
+            st.markdown(text)
+        elif document.doc_type == DocumentType.HTML:
+            components.html(text, height=760, scrolling=True)
+        elif document.doc_type == DocumentType.CODE:
+            st.code(text, language=_CODE_LANGUAGES.get(document.suffix, "text"))
+        else:
+            escaped = html_lib.escape(text)
+            st.markdown(
+                f"""
+                <div style="max-height: 760px; overflow: auto; white-space: pre-wrap;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            border-radius: 8px; padding: 1rem;">
+                    {escaped}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 def _table_dataframe(rows: list[list[str]]) -> pd.DataFrame:

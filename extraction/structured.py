@@ -27,19 +27,25 @@ def _section_units(text: str) -> list[ExtractedUnit]:
 
     lines = text.splitlines()
     sections: list[ExtractedUnit] = []
-    current_title = "Introduction"
+    current_title: str | None = None
     current_lines: list[str] = []
     current_level = 1
 
     def flush() -> None:
         if current_lines:
+            section_text = "\n".join(current_lines).strip()
             idx = len(sections) + 1
             sections.append(
                 ExtractedUnit(
                     id=f"section-{idx}",
-                    text="\n".join(current_lines).strip(),
+                    text=section_text,
                     unit_type="section",
-                    metadata={"title": current_title, "level": current_level, "section": idx},
+                    metadata={
+                        "title": current_title or _derived_unit_title(section_text),
+                        "level": current_level,
+                        "section": idx,
+                        "reason": "text_heading" if current_title else "before_first_heading",
+                    },
                 )
             )
 
@@ -63,7 +69,25 @@ def _section_units(text: str) -> list[ExtractedUnit]:
         else:
             current_lines.append(line)
     flush()
-    return sections or [ExtractedUnit(id="section-1", text=text, unit_type="section", metadata={"title": "Document", "level": 1})]
+    return sections or [
+        ExtractedUnit(
+            id="section-1",
+            text=text,
+            unit_type="section",
+            metadata={"title": _derived_unit_title(text), "level": 1, "reason": "whole_document"},
+        )
+    ]
+
+
+def _derived_unit_title(text: str, fallback: str = "Document Start") -> str:
+    for line in text.splitlines():
+        stripped = re.sub(r"\s+", " ", line).strip()
+        if not stripped:
+            continue
+        if _is_repeated_page_footer_text(stripped):
+            continue
+        return stripped[:90]
+    return fallback
 
 
 def _numbered_heading_match(line: str, next_line: str = "") -> re.Match[str] | None:
@@ -118,13 +142,14 @@ def _top_level_section_units(text: str) -> list[ExtractedUnit]:
 
     units: list[ExtractedUnit] = []
     front_matter = text[: matches[0].start()].strip()
+    front_offset = 1 if front_matter else 0
     if front_matter:
         units.append(
             ExtractedUnit(
                 id="front-matter",
                 text=front_matter,
-                unit_type="front_matter",
-                metadata={"title": "Front Matter", "level": 0},
+                unit_type="section",
+                metadata={"title": _derived_unit_title(front_matter), "level": 1, "section": 1, "reason": "before_first_heading"},
             )
         )
 
@@ -155,7 +180,7 @@ def _top_level_section_units(text: str) -> list[ExtractedUnit]:
                 id=f"section-{section_number}",
                 text=section_text,
                 unit_type="section",
-                metadata={"title": title, "level": 1, "section": section_number},
+                metadata={"title": title, "level": 1, "section": section_number + front_offset},
             )
         )
 
@@ -217,8 +242,40 @@ def _pdf_section_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | None
         return full_text, []
 
     units: list[ExtractedUnit] = []
-    for heading_number, (heading_index, heading) in enumerate(headings, start=1):
-        next_heading_index = headings[heading_number][0] if heading_number < len(headings) else len(blocks)
+    first_heading_index = headings[0][0]
+    front_blocks = [
+        block
+        for block in blocks[:first_heading_index]
+        if not _is_repeated_page_footer(block) and not block.is_table and _normalized_heading(block.text) not in repeated_texts
+    ]
+    if front_blocks:
+        front_text = "\n\n".join(block.text for block in front_blocks).strip()
+        first_block = front_blocks[0]
+        units.append(
+            ExtractedUnit(
+                id="section-1",
+                text=front_text,
+                unit_type="section",
+                metadata={
+                    "title": _derived_unit_title(front_text),
+                    "level": 1,
+                    "section": 1,
+                    "page": first_block.page,
+                    "bbox": first_block.bbox,
+                    "order": _position_order(first_block.page, first_block.bbox),
+                    "reason": "before_first_heading",
+                },
+            )
+        )
+
+    section_offset = len(units)
+    for heading_index_in_list, (heading_index, heading) in enumerate(headings):
+        next_heading_index = (
+            headings[heading_index_in_list + 1][0]
+            if heading_index_in_list + 1 < len(headings)
+            else len(blocks)
+        )
+        section_number = section_offset + heading_index_in_list + 1
         section_blocks = [
             block
             for block in blocks[heading_index:next_heading_index]
@@ -227,13 +284,13 @@ def _pdf_section_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | None
         section_text = "\n\n".join(block.text for block in section_blocks).strip()
         units.append(
             ExtractedUnit(
-                id=f"section-{heading_number}",
+                id=f"section-{section_number}",
                 text=section_text,
                 unit_type="section",
                 metadata={
                     "title": heading.text,
                     "level": 1,
-                    "section": heading_number,
+                    "section": section_number,
                     "page": heading.page,
                     "bbox": heading.bbox,
                     "order": _position_order(heading.page, heading.bbox),
@@ -301,9 +358,13 @@ def _is_pdf_heading(block: _PdfTextBlock, body_size: float) -> bool:
 
 
 def _is_repeated_page_footer(block: _PdfTextBlock) -> bool:
-    text = block.text.strip()
+    return _is_repeated_page_footer_text(block.text.strip())
+
+
+def _is_repeated_page_footer_text(text: str) -> bool:
     return bool(
-        re.match(r"^Page\s+\d+$", text, re.IGNORECASE)
+        re.match(r"^\d+$", text)
+        or re.match(r"^Page\s+\d+$", text, re.IGNORECASE)
         or re.match(r"^.+\s+\d+$", text)
         or re.match(r"^Version\s+[\d.]+$", text, re.IGNORECASE)
         or text.lower() == "internal"
@@ -372,24 +433,19 @@ class HierarchicalExtractor(BaseExtractor):
     def extract(self, document: UploadedDocument) -> ExtractionResult:
         section_result = SectionWiseExtractor().extract(document)
         text = section_result.text
-        sections = [unit for unit in section_result.units if unit.unit_type == "section"]
-        roots: list[ExtractedUnit] = []
-        stack: list[ExtractedUnit] = []
-        for section in sections:
-            level = int(section.metadata.get("level", 1))
-            while stack and int(stack[-1].metadata.get("level", 1)) >= level:
-                stack.pop()
-            if stack:
-                stack[-1].children.append(section)
-                section.metadata["parent"] = stack[-1].id
-            else:
-                roots.append(section)
-            stack.append(section)
-        table_units = [unit for unit in section_result.units if unit.unit_type == "table"]
+        roots = _hierarchical_units(section_result.units)
+        all_units = _flatten_hierarchy_units(roots)
+        sections = _flatten_units_by_type(roots, "section")
+        table_units = _flatten_units_by_type(roots, "table")
         return self._result(
             text,
-            _attach_unit_context(_ordered_units([*roots, *table_units])),
-            {"sections": len(sections), "hierarchy_roots": len(roots), "tables_detected": len(table_units)},
+            _attach_hierarchy_context(roots),
+            {
+                "unit_count": len(all_units),
+                "sections": len(sections),
+                "hierarchy_roots": len(roots),
+                "tables_detected": len(table_units),
+            },
         )
 
 
@@ -431,6 +487,77 @@ class LayoutAwareExtractor(BaseExtractor):
             _attach_unit_context(_ordered_units([*units, *table_units])),
             {"layout_blocks": len(units), "tables_detected": len(table_units)},
         )
+
+
+def _hierarchical_units(units: list[ExtractedUnit]) -> list[ExtractedUnit]:
+    roots: list[ExtractedUnit] = []
+    stack: list[ExtractedUnit] = []
+
+    for unit in _ordered_units(units):
+        unit.children = []
+        if unit.unit_type == "section":
+            level = max(1, int(unit.metadata.get("level", 1) or 1))
+            while stack and max(1, int(stack[-1].metadata.get("level", 1) or 1)) >= level:
+                stack.pop()
+            if stack:
+                parent = stack[-1]
+                parent.children.append(unit)
+                unit.metadata["parent"] = parent.id
+                unit.metadata["parent_section_id"] = parent.id
+                unit.metadata["parent_section_title"] = parent.metadata.get("title", "")
+            else:
+                roots.append(unit)
+            stack.append(unit)
+            continue
+
+        if stack:
+            parent = stack[-1]
+            parent.children.append(unit)
+            unit.metadata["parent"] = parent.id
+            unit.metadata["parent_section_id"] = parent.id
+            unit.metadata["parent_section_title"] = parent.metadata.get("title", "")
+        else:
+            roots.append(unit)
+
+    return roots
+
+
+def _attach_hierarchy_context(units: list[ExtractedUnit]) -> list[ExtractedUnit]:
+    def visit(unit: ExtractedUnit, path: list[str]) -> None:
+        current_path = path
+        if unit.unit_type == "section":
+            title = str(unit.metadata.get("title", "")).strip()
+            current_path = [*path, title] if title else path
+            unit.metadata["section_path"] = " > ".join(current_path)
+        elif current_path:
+            unit.metadata["section_path"] = " > ".join(current_path)
+
+        for child in unit.children:
+            if unit.unit_type == "section":
+                child.metadata.setdefault("parent_section_id", unit.id)
+                child.metadata.setdefault("parent_section_title", unit.metadata.get("title", ""))
+            visit(child, current_path)
+
+    for unit in units:
+        visit(unit, [])
+    return units
+
+
+def _flatten_hierarchy_units(units: list[ExtractedUnit]) -> list[ExtractedUnit]:
+    flat: list[ExtractedUnit] = []
+    for unit in units:
+        flat.append(unit)
+        flat.extend(_flatten_hierarchy_units(unit.children))
+    return flat
+
+
+def _flatten_units_by_type(units: list[ExtractedUnit], unit_type: str) -> list[ExtractedUnit]:
+    matched: list[ExtractedUnit] = []
+    for unit in units:
+        if unit.unit_type == unit_type:
+            matched.append(unit)
+        matched.extend(_flatten_units_by_type(unit.children, unit_type))
+    return matched
 
 
 class TableAwareExtractor(BaseExtractor):
@@ -730,9 +857,10 @@ def _docx_ordered_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | Non
         doc = Document(BytesIO(content))
         units: list[ExtractedUnit] = []
         full_parts: list[str] = []
-        current_title = "Introduction"
+        current_title: str | None = None
         current_level = 1
         current_lines: list[str] = []
+        current_start_order = 1.0
         section_count = 0
         table_count = 0
         order = 0
@@ -745,17 +873,18 @@ def _docx_ordered_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | Non
                 current_lines = []
                 return
             section_count += 1
+            title = current_title or _derived_unit_title(text)
             units.append(
                 ExtractedUnit(
                     id=f"section-{section_count}",
                     text=text,
                     unit_type="section",
                     metadata={
-                        "title": current_title,
+                        "title": title,
                         "level": current_level,
                         "section": section_count,
-                        "order": order - 0.1,
-                        "reason": "docx_heading",
+                        "order": current_start_order,
+                        "reason": "docx_heading" if current_title else "before_first_heading",
                     },
                 )
             )
@@ -775,8 +904,11 @@ def _docx_ordered_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | Non
                 if heading:
                     flush_section()
                     current_title, current_level = heading
+                    current_start_order = float(order)
                     current_lines = [text]
                 else:
+                    if not current_lines:
+                        current_start_order = float(order)
                     current_lines.append(text)
             elif child.tag == qn("w:tbl"):
                 order += 1
@@ -784,9 +916,19 @@ def _docx_ordered_units(content: bytes) -> tuple[str, list[ExtractedUnit]] | Non
                 rows = _clean_table_rows([[cell.text for cell in row.cells] for row in table.rows])
                 if not _is_valid_table(rows):
                     continue
-                flush_section()
                 table_count += 1
-                table_unit = _make_table_unit(table_count, rows, "docx", {"order": order})
+                table_unit = _make_table_unit(
+                    table_count,
+                    rows,
+                    "docx",
+                    {"order": order}
+                    if current_title is None
+                    else {
+                        "order": order,
+                        "parent_section_title": current_title,
+                        "section_path": current_title,
+                    },
+                )
                 units.append(table_unit)
                 full_parts.append(table_unit.text)
 
@@ -814,17 +956,46 @@ def _next_docx_paragraph_text(children: list[object], start_index: int, doc: obj
 
 def _docx_heading(paragraph: object, next_text: str) -> tuple[str, int] | None:
     text = paragraph.text.strip()
+    if not text:
+        return None
+
+    outline_level = _docx_outline_level(paragraph)
+    if outline_level is not None:
+        return text, outline_level
+
     style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
     match = re.search(r"heading\s*(\d+)", style_name, re.IGNORECASE)
     if match:
         return text, int(match.group(1))
 
-    numbered = re.match(r"^(\d+(?:\.\d+)*)\s+(.{3,})$", text)
+    if re.search(r"\b(title|subtitle|section|chapter)\b", style_name, re.IGNORECASE):
+        return text, 1
+
+    numbered = _numbered_heading_match(text, next_text)
     if numbered:
         return numbered.group(2).strip(), numbered.group(1).count(".") + 1
 
     if _looks_like_text_heading(text, next_text):
         return text, 1
+    return None
+
+
+def _docx_outline_level(paragraph: object) -> int | None:
+    try:
+        from docx.oxml.ns import qn
+
+        paragraph_properties = getattr(getattr(paragraph, "_p", None), "pPr", None)
+        style_properties = getattr(getattr(getattr(paragraph, "style", None), "element", None), "pPr", None)
+        for properties in (paragraph_properties, style_properties):
+            outline_level = getattr(properties, "outlineLvl", None)
+            if properties is None or outline_level is None:
+                continue
+            value = outline_level.get(qn("w:val"))
+            if value is None:
+                continue
+            return int(value) + 1
+    except Exception:
+        return None
     return None
 
 

@@ -7,7 +7,7 @@ from analytics.metrics import chunk_metrics
 from assistant.rag_assistant import RAGAssistant
 from chunking.registry import get_chunker
 from extraction.registry import EXTRACTION_REGISTRY, get_extractor
-from ui.components import show_chunk, show_retrieved, show_units
+from ui.components import show_chunk, show_original_document, show_retrieved, show_units
 from utils.compatibility import CHUNKING_STRATEGIES, compatible_chunkers
 from utils.document import human_size, make_uploaded_document
 
@@ -124,9 +124,8 @@ with document_tab:
     uploaded_file = st.file_uploader(
         "Choose a document",
         type=[
-            "pdf", "docx", "txt", "md", "markdown", "html", "htm",
-            "py", "js", "ts", "tsx", "jsx", "java", "go", "rs",
-            "cpp", "c", "h", "cs", "php", "rb",
+            "pdf", "docx", "txt", "md", "markdown", "html",
+            "py"
         ],
         label_visibility="collapsed",
     )
@@ -144,6 +143,7 @@ with document_tab:
         cols[1].metric("Type", document.doc_type.value)
         cols[2].metric("Size", human_size(document.size_bytes))
         cols[3].metric("Suffix", document.suffix or "none")
+        show_original_document(document)
     else:
         st.info("Upload a PDF, DOCX, TXT, Markdown, HTML, or code file to begin.")
 
